@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import time as dt_time, timedelta
+from datetime import datetime, time as dt_time, timedelta
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -27,6 +27,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Tracks uptime state across polling cycles — reset on restart, which is fine
+# because the next check will detect and alert on any ongoing outage.
+_uptime: dict = {"is_down": False, "down_since": None}
+
 
 # ── Core commands ──────────────────────────────────────────────────────────────
 
@@ -49,15 +53,17 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_wp_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "*WordPress Maintenance Commands*\n\n"
-        "/wp\\_status \u2014 Quick health check on all critical pages\n"
-        "/wp\\_report \u2014 Full maintenance scan (read-only, no changes made)\n"
+        "/wp\\_status \u2014 Health check on all critical pages\n"
+        "/wp\\_backup \u2014 Check when the site was last backed up\n"
+        "/wp\\_report \u2014 Full maintenance scan (read-only)\n"
         "/wp\\_update \u2014 Full maintenance + update all plugins\n"
         "/wp\\_create\\_page \u2014 Create a new page with AI-drafted content\n"
-        "  _Usage:_ /wp\\_create\\_page Title | Brief description\n"
-        "  _Example:_ /wp\\_create\\_page About Us | Family business selling handmade goods\n\n"
-        "Scheduled jobs (auto-run when WP\\_URL is set):\n"
-        "\u2022 Daily health check at 08:00 UTC \u2014 alerts only if issues found\n"
-        "\u2022 Quarterly full maintenance \u2014 runs every 91 days\n"
+        "  _Usage:_ /wp\\_create\\_page Title | Brief description\n\n"
+        "*Scheduled jobs (when WP\\_URL is set):*\n"
+        "\u2022 Every 5 min \u2014 uptime check, instant alert if site goes down\n"
+        "\u2022 Daily 08:00 UTC \u2014 health check on all pages\n"
+        "\u2022 Weekly Monday \u2014 backup status check\n"
+        "\u2022 Every 91 days \u2014 full maintenance + plugin updates\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -67,6 +73,23 @@ async def cmd_wp_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("Checking site health\u2026")
     result = await asyncio.to_thread(wp.run_quick_health_check)
     await update.message.reply_text(result, parse_mode="Markdown")
+
+
+async def cmd_wp_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check when the site was last backed up."""
+    await update.message.reply_text("Checking backup status\u2026")
+    config = wp.load_wp_config()
+    if not config.url:
+        await update.message.reply_text("WP\\_URL is not configured in .env", parse_mode="Markdown")
+        return
+    result = await asyncio.to_thread(wp.check_last_backup, config)
+    icon = "\u2705" if result["ok"] else "\u274c"
+    lines = [f"*Backup Status*\n", f"{icon} {result['message']}"]
+    if result.get("plugin") and result["plugin"] != "unknown":
+        lines.append(f"_Plugin: {result['plugin']}_")
+    if result.get("last_backup"):
+        lines.append(f"_Last backup: {result['last_backup']}_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_wp_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -137,8 +160,69 @@ async def cmd_wp_create_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ── Scheduled jobs ─────────────────────────────────────────────────────────────
 
+async def _uptime_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Runs every 5 minutes. Sends one alert the moment the site goes down,
+    and a recovery message when it comes back up. Silent when everything is fine.
+    """
+    config = wp.load_wp_config()
+    if not config.url:
+        return
+
+    is_up, status_code = await asyncio.to_thread(wp.is_site_up, config)
+
+    if not is_up and not _uptime["is_down"]:
+        # Transition: up → down
+        _uptime["is_down"] = True
+        _uptime["down_since"] = datetime.now()
+
+        if status_code == 0:
+            reason = "connection refused"
+        elif status_code == -1:
+            reason = "request timed out"
+        elif status_code > 0:
+            reason = f"HTTP {status_code}"
+        else:
+            reason = "unknown error"
+
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=(
+                f"\U0001f6a8 *Site Down*\n\n"
+                f"{config.url} is not responding ({reason}).\n"
+                f"Checking again every 5 minutes."
+            ),
+            parse_mode="Markdown",
+        )
+        logger.warning(f"Site down detected: {config.url} ({reason})")
+
+    elif is_up and _uptime["is_down"]:
+        # Transition: down → up
+        down_since = _uptime["down_since"]
+        if down_since:
+            delta = datetime.now() - down_since
+            mins = int(delta.total_seconds() // 60)
+            duration = f"{mins} minute(s)" if mins < 60 else f"{mins // 60}h {mins % 60}m"
+        else:
+            duration = "unknown duration"
+
+        _uptime["is_down"] = False
+        _uptime["down_since"] = None
+
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=(
+                f"\u2705 *Site Recovered*\n\n"
+                f"{config.url} is back online.\n"
+                f"Was down for ~{duration}."
+            ),
+            parse_mode="Markdown",
+        )
+        logger.info(f"Site recovered: {config.url} (was down ~{duration})")
+
+
 async def _daily_health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily site health check — always sends a status message."""
+    """Daily 08:00 UTC — full page-by-page health check, always sent."""
     logger.info("Running daily WordPress health check...")
     result = await asyncio.to_thread(wp.run_quick_health_check)
     await context.bot.send_message(
@@ -148,8 +232,33 @@ async def _daily_health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _weekly_backup_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Weekly Monday 08:05 UTC — check backup freshness, alert if overdue."""
+    logger.info("Running weekly backup check...")
+    config = wp.load_wp_config()
+    if not config.url:
+        return
+    result = await asyncio.to_thread(wp.check_last_backup, config)
+    if not result["ok"]:
+        icon = "\u274c"
+        prefix = "\u26a0\ufe0f *Backup Alert*\n\n"
+    else:
+        icon = "\u2705"
+        prefix = "*Weekly Backup Check*\n\n"
+    lines = [f"{prefix}{icon} {result['message']}"]
+    if result.get("plugin") and result["plugin"] != "unknown":
+        lines.append(f"_Plugin: {result['plugin']}_")
+    if result.get("last_backup"):
+        lines.append(f"_Last backup: {result['last_backup']}_")
+    await context.bot.send_message(
+        chat_id=CHAT_ID,
+        text="\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
 async def _quarterly_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Quarterly full maintenance — checks health, updates plugins, runs security scan."""
+    """Every 91 days — full maintenance run with plugin updates."""
     logger.info("Running quarterly WordPress maintenance...")
     await context.bot.send_message(
         chat_id=CHAT_ID,
@@ -189,22 +298,34 @@ async def on_startup(application: Application) -> None:
     logger.info("Startup message sent to Telegram.")
 
     if os.getenv("WP_URL"):
-        # Daily health check at 08:00 UTC — silent unless issues found
-        application.job_queue.run_daily(
-            _daily_health_check,
-            time=dt_time(8, 0, 0),
-            name="wp_daily_health",
+        jq = application.job_queue
+
+        # Uptime check every 5 minutes — instant alert on outage
+        jq.run_repeating(
+            _uptime_check,
+            interval=timedelta(minutes=5),
+            first=timedelta(minutes=1),  # first check 1 min after boot
+            name="wp_uptime",
         )
-        # Quarterly full maintenance — every 91 days
-        application.job_queue.run_repeating(
+        # Daily full-page health check at 08:00 UTC
+        jq.run_daily(_daily_health_check, time=dt_time(8, 0, 0), name="wp_daily_health")
+        # Weekly backup check Monday at 08:05 UTC (days: 0=Mon … 6=Sun in PTB)
+        jq.run_daily(
+            _weekly_backup_check,
+            time=dt_time(8, 5, 0),
+            days=(0,),
+            name="wp_weekly_backup",
+        )
+        # Quarterly full maintenance every 91 days
+        jq.run_repeating(
             _quarterly_maintenance,
             interval=timedelta(days=91),
             first=timedelta(days=91),
             name="wp_quarterly_maintenance",
         )
-        logger.info("WordPress jobs scheduled: daily health check + quarterly maintenance.")
+        logger.info("WordPress jobs scheduled: uptime (5 min), daily health, weekly backup, quarterly maintenance.")
     else:
-        logger.info("WP_URL not set — WordPress maintenance jobs not scheduled.")
+        logger.info("WP_URL not set — WordPress jobs not scheduled.")
 
 
 def main() -> None:
@@ -223,6 +344,7 @@ def main() -> None:
     # WordPress maintenance
     app.add_handler(CommandHandler("wp_help", cmd_wp_help))
     app.add_handler(CommandHandler("wp_status", cmd_wp_status))
+    app.add_handler(CommandHandler("wp_backup", cmd_wp_backup))
     app.add_handler(CommandHandler("wp_report", cmd_wp_report))
     app.add_handler(CommandHandler("wp_update", cmd_wp_update))
     app.add_handler(CommandHandler("wp_create_page", cmd_wp_create_page))

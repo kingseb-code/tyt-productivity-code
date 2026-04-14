@@ -290,6 +290,129 @@ def check_security(config: WPConfig) -> dict:
     }
 
 
+# ── Uptime monitoring ─────────────────────────────────────────────────────────
+
+def is_site_up(config: WPConfig) -> tuple[bool, int]:
+    """
+    Single lightweight HTTP check against the homepage.
+    Returns (is_up, http_status_code).
+    status 0  = connection refused
+    status -1 = timeout
+    """
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            resp = client.get(config.url + "/")
+            return resp.status_code == 200, resp.status_code
+    except httpx.ConnectError:
+        return False, 0
+    except httpx.TimeoutException:
+        return False, -1
+    except Exception:
+        return False, -2
+
+
+# ── Backup verification ────────────────────────────────────────────────────────
+
+def check_last_backup(config: WPConfig, max_age_days: int = 7) -> dict:
+    """
+    Check when the site was last backed up.
+
+    Detection order:
+    1. UpdraftPlus  — reads updraft_last_backup_time from wp_options via WP-CLI
+    2. BackWPup     — reads backwpup_last_backup option
+    3. File search  — looks for recent .zip files in wp-content/updraft or
+                      wp-content/backups via SSH (requires SSH config)
+
+    Returns a dict with keys: plugin, last_backup (ISO str), age_days, ok, message.
+    """
+    # ── UpdraftPlus ──
+    ok, output = _run_wpcli(config, ["option", "get", "updraft_last_backup_time"])
+    if ok and output.strip().isdigit():
+        ts = int(output.strip())
+        if ts > 0:
+            last = datetime.fromtimestamp(ts)
+            age = (datetime.now() - last).days
+            return {
+                "plugin": "UpdraftPlus",
+                "last_backup": last.strftime("%d %b %Y %H:%M"),
+                "age_days": age,
+                "ok": age <= max_age_days,
+                "message": (
+                    f"Last backup {age} day(s) ago"
+                    if age <= max_age_days
+                    else f"No backup in {age} days \u2014 overdue"
+                ),
+            }
+
+    # ── BackWPup ──
+    ok, output = _run_wpcli(config, ["option", "get", "backwpup_last_backup"])
+    if ok and output.strip().isdigit():
+        ts = int(output.strip())
+        if ts > 0:
+            last = datetime.fromtimestamp(ts)
+            age = (datetime.now() - last).days
+            return {
+                "plugin": "BackWPup",
+                "last_backup": last.strftime("%d %b %Y %H:%M"),
+                "age_days": age,
+                "ok": age <= max_age_days,
+                "message": (
+                    f"Last backup {age} day(s) ago"
+                    if age <= max_age_days
+                    else f"No backup in {age} days \u2014 overdue"
+                ),
+            }
+
+    # ── File-based fallback (SSH required) ──
+    if config.ssh_host and config.ssh_user:
+        ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30"]
+        if config.ssh_key_path:
+            ssh_cmd += ["-i", config.ssh_key_path]
+        ssh_cmd.append(f"{config.ssh_user}@{config.ssh_host}")
+        ssh_cmd.append(
+            f"find ~/public_html/wp-content/updraft "
+            f"~/public_html/wp-content/backups "
+            f"~/public_html/wp-content/backup-db "
+            f"-name '*.zip' -o -name '*.gz' 2>/dev/null "
+            f"| xargs ls -t 2>/dev/null | head -1"
+        )
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout.strip():
+                newest_file = result.stdout.strip()
+                # Get mtime of that file
+                stat_cmd = ssh_cmd[:-1] + [f"stat -c %Y {shlex.quote(newest_file)} 2>/dev/null"]
+                stat_result = subprocess.run(stat_cmd, capture_output=True, text=True, timeout=15)
+                if stat_result.returncode == 0 and stat_result.stdout.strip().isdigit():
+                    ts = int(stat_result.stdout.strip())
+                    last = datetime.fromtimestamp(ts)
+                    age = (datetime.now() - last).days
+                    return {
+                        "plugin": "file-based",
+                        "last_backup": last.strftime("%d %b %Y %H:%M"),
+                        "age_days": age,
+                        "ok": age <= max_age_days,
+                        "message": (
+                            f"Backup file found, {age} day(s) old"
+                            if age <= max_age_days
+                            else f"Newest backup file is {age} days old \u2014 overdue"
+                        ),
+                    }
+        except Exception as e:
+            logger.warning(f"Backup file search failed: {e}")
+
+    return {
+        "plugin": "unknown",
+        "last_backup": None,
+        "age_days": None,
+        "ok": False,
+        "message": (
+            "Could not detect backup status. "
+            "Install UpdraftPlus and configure SSH to enable backup monitoring."
+        ),
+    }
+
+
 # ── Content management ─────────────────────────────────────────────────────────
 
 def draft_page_content(title: str, description: str) -> str:
