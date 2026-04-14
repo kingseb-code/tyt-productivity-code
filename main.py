@@ -138,15 +138,14 @@ async def cmd_wp_create_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ── Scheduled jobs ─────────────────────────────────────────────────────────────
 
 async def _daily_health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily site health check — sends an alert only when issues are found."""
+    """Daily site health check — always sends a status message."""
     logger.info("Running daily WordPress health check...")
     result = await asyncio.to_thread(wp.run_quick_health_check)
-    if "\u274c" in result:  # only alert on failures
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"\u26a0\ufe0f *Site Health Alert*\n\n{result}",
-            parse_mode="Markdown",
-        )
+    await context.bot.send_message(
+        chat_id=CHAT_ID,
+        text=result,
+        parse_mode="Markdown",
+    )
 
 
 async def _quarterly_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
