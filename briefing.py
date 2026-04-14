@@ -8,6 +8,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from models import get_model
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ Emails:
 {email_text}"""
 
     message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model=get_model("worker"),
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
