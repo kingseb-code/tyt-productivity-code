@@ -5,6 +5,7 @@
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="$REPO_DIR/.venv"
 SERVICE_NAME="openclaw"
 
 echo "=== OpenClaw Installer ==="
@@ -18,13 +19,12 @@ if [ ! -f "$REPO_DIR/.env" ]; then
     exit 1
 fi
 
-# 2. Ensure pip is available
+# 2. Create virtual environment and install dependencies
 echo "[1/4] Installing Python dependencies..."
-if ! python3 -m pip --version &>/dev/null; then
-    echo "pip not found — installing..."
-    sudo apt-get install -y python3-pip
+if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR"
 fi
-python3 -m pip install -r "$REPO_DIR/requirements.txt" --quiet
+"$VENV_DIR/bin/pip" install -r "$REPO_DIR/requirements.txt" --quiet
 echo "Done."
 
 # 3. Set up wsl.conf (enables systemd)
@@ -42,8 +42,8 @@ fi
 echo "[3/4] Installing systemd service..."
 sudo cp "$REPO_DIR/systemd/$SERVICE_NAME.service" /etc/systemd/system/
 
-# Check if systemd is actually running (it won't be until after WSL2 restart)
-if pidof systemd &>/dev/null || [ "$(cat /proc/1/comm)" = "systemd" ]; then
+# Check if systemd is actually running
+if [ "$(cat /proc/1/comm)" = "systemd" ]; then
     sudo systemctl daemon-reload
     sudo systemctl enable "$SERVICE_NAME"
 
@@ -57,19 +57,19 @@ if pidof systemd &>/dev/null || [ "$(cat /proc/1/comm)" = "systemd" ]; then
     echo "OpenClaw will now start automatically every time WSL2 starts."
 else
     sudo systemctl daemon-reload 2>/dev/null || true
+
     echo ""
-    echo "=== Almost done — one more step required ==="
+    echo "=== Almost done — WSL2 restart required ==="
     echo ""
-    echo "systemd is not active yet. You need to restart WSL2 once."
+    echo "systemd is not active yet. You need to restart WSL2."
     echo ""
-    echo "Do this in Windows PowerShell (NOT here):"
-    echo "  wsl --shutdown"
-    echo "  wsl"
+    echo "  1. Open Windows PowerShell (the blue one, NOT this terminal)"
+    echo "  2. Run:  wsl --shutdown"
+    echo "  3. Close this terminal and open WSL2/Ubuntu again"
+    echo "  4. Run:  cd ~/tyt-productivity-code && bash scripts/install.sh"
     echo ""
-    echo "After WSL2 restarts, run this script again to finish the install."
 fi
 
-echo ""
 echo "Useful commands (once systemd is active):"
 echo "  sudo systemctl status openclaw   — check if running"
 echo "  sudo systemctl restart openclaw  — restart after code changes"
