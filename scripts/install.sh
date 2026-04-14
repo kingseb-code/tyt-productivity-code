@@ -21,11 +21,10 @@ fi
 
 # 2. Create virtual environment and install dependencies
 echo "[1/4] Installing Python dependencies..."
-if [ ! -d "$VENV_DIR" ]; then
-    if ! python3 -m venv --help &>/dev/null; then
-        echo "python3-venv not found — installing..."
-        sudo apt-get install -y python3-venv python3-full
-    fi
+if [ ! -f "$VENV_DIR/bin/pip" ]; then
+    echo "python3-venv not found — installing..."
+    sudo apt-get install -y python3-venv python3-full
+    rm -rf "$VENV_DIR"
     python3 -m venv "$VENV_DIR"
 fi
 "$VENV_DIR/bin/pip" install -r "$REPO_DIR/requirements.txt" --quiet
