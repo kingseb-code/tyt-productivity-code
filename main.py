@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from briefing import run_briefing
 
 load_dotenv()
 
@@ -32,6 +33,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("OpenClaw: Online")
 
 
+async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Fetching your briefing...")
+    text = run_briefing()
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 async def on_startup(application: Application) -> None:
     await application.bot.send_message(
         chat_id=CHAT_ID,
@@ -50,6 +57,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
 
     logger.info("OpenClaw starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
