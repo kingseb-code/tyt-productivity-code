@@ -60,8 +60,7 @@ async def cmd_wp_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/wp\\_create\\_page \u2014 Create a new page with AI-drafted content\n"
         "  _Usage:_ /wp\\_create\\_page Title | Brief description\n\n"
         "*Scheduled jobs (when WP\\_URL is set):*\n"
-        "\u2022 Every 5 min \u2014 uptime check, instant alert if site goes down\n"
-        "\u2022 Daily 08:00 UTC \u2014 health check on all pages\n"
+        "\u2022 Daily 08:00 UTC \u2014 uptime + health check on all pages\n"
         "\u2022 Weekly Monday \u2014 backup status check\n"
         "\u2022 Every 91 days \u2014 full maintenance + plugin updates\n"
     )
@@ -300,13 +299,8 @@ async def on_startup(application: Application) -> None:
     if os.getenv("WP_URL"):
         jq = application.job_queue
 
-        # Uptime check every 5 minutes — instant alert on outage
-        jq.run_repeating(
-            _uptime_check,
-            interval=timedelta(minutes=5),
-            first=timedelta(minutes=1),  # first check 1 min after boot
-            name="wp_uptime",
-        )
+        # Uptime check daily at 08:00 UTC
+        jq.run_daily(_uptime_check, time=dt_time(8, 0, 0), name="wp_uptime")
         # Daily full-page health check at 08:00 UTC
         jq.run_daily(_daily_health_check, time=dt_time(8, 0, 0), name="wp_daily_health")
         # Weekly backup check Monday at 08:05 UTC (days: 0=Mon … 6=Sun in PTB)
@@ -323,7 +317,7 @@ async def on_startup(application: Application) -> None:
             first=timedelta(days=91),
             name="wp_quarterly_maintenance",
         )
-        logger.info("WordPress jobs scheduled: uptime (5 min), daily health, weekly backup, quarterly maintenance.")
+        logger.info("WordPress jobs scheduled: uptime (daily), daily health, weekly backup, quarterly maintenance.")
     else:
         logger.info("WP_URL not set — WordPress jobs not scheduled.")
 
