@@ -11,6 +11,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID"))
 
+os.makedirs("logs", exist_ok=True)
+
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
@@ -39,8 +41,6 @@ async def on_startup(application: Application) -> None:
 
 
 def main() -> None:
-    os.makedirs("logs", exist_ok=True)
-
     app = (
         Application.builder()
         .token(BOT_TOKEN)
