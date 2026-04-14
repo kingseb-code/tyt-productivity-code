@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenClaw TYT Automation Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kingseb
+WorkingDirectory=/home/kingseb/tyt-productivity-code
+EnvironmentFile=/home/kingseb/tyt-productivity-code/.env
+ExecStart=/usr/bin/python3 /home/kingseb/tyt-productivity-code/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
