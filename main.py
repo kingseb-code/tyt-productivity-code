@@ -53,6 +53,7 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_wp_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "*WordPress Maintenance Commands*\n\n"
+        "/wp\\_setup \u2014 First-run setup: test connections, audit all plugins, list action items\n"
         "/wp\\_status \u2014 Health check on all critical pages\n"
         "/wp\\_backup \u2014 Check when the site was last backed up\n"
         "/wp\\_report \u2014 Full maintenance scan (read-only)\n"
@@ -65,6 +66,16 @@ async def cmd_wp_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "\u2022 Every 91 days \u2014 full maintenance + plugin updates\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_wp_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """First-run setup check — tests connections, audits all plugins, lists action items."""
+    await update.message.reply_text(
+        "Running setup check\u2026 (this scans all plugins and tests every connection)"
+    )
+    result = await asyncio.to_thread(wp.run_setup_check)
+    for chunk in _split_message(result):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 
 async def cmd_wp_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -337,6 +348,7 @@ def main() -> None:
 
     # WordPress maintenance
     app.add_handler(CommandHandler("wp_help", cmd_wp_help))
+    app.add_handler(CommandHandler("wp_setup", cmd_wp_setup))
     app.add_handler(CommandHandler("wp_status", cmd_wp_status))
     app.add_handler(CommandHandler("wp_backup", cmd_wp_backup))
     app.add_handler(CommandHandler("wp_report", cmd_wp_report))

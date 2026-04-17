@@ -504,6 +504,303 @@ def generate_maintenance_report(health: dict, plugins: dict, security: dict) -> 
     return message.content[0].text
 
 
+# ── Setup and onboarding ──────────────────────────────────────────────────────
+
+# Known plugin categories by slug — used to flag missing essentials
+_BACKUP_SLUGS = {"updraftplus", "backwpup", "duplicator", "all-in-one-wp-migration", "blogvault", "wp-staging"}
+_SECURITY_SLUGS = {"wordfence", "better-wp-security", "sucuri-scanner", "wp-cerber", "all-in-one-wp-security-and-firewall", "shield-security"}
+_REMOVE_SLUGS = {"hello-dolly"}  # default WordPress filler plugins with no purpose
+
+
+def _plugin_name(p: dict) -> str:
+    """Best available display name for a plugin dict (WP-CLI or REST API)."""
+    return p.get("title") or p.get("name") or p.get("plugin", "").split("/")[0]
+
+
+def _plugin_slug(p: dict) -> str:
+    """Normalised slug for category lookups."""
+    raw = p.get("name") or p.get("plugin", "")
+    return raw.split("/")[0].lower()
+
+
+def get_all_plugins(config: WPConfig) -> dict:
+    """
+    Fetch the complete plugin list — all statuses, with update info.
+
+    Primary:  WP-CLI (full data — name, version, status, update availability)
+    Fallback: WordPress REST API (two calls: active + inactive; no update info)
+    """
+    # ── WP-CLI ──
+    ok, output = _run_wpcli(config, [
+        "plugin", "list", "--format=json",
+        "--fields=name,title,status,version,update,update_version",
+    ])
+    if ok and output:
+        try:
+            plugins = json.loads(output)
+            return {
+                "method": "wpcli",
+                "total": len(plugins),
+                "active": [p for p in plugins if p.get("status") == "active"],
+                "inactive": [p for p in plugins if p.get("status") == "inactive"],
+                "updates": [p for p in plugins if p.get("update") == "available"],
+                "all": plugins,
+                "error": None,
+            }
+        except json.JSONDecodeError:
+            pass
+
+    # ── REST API fallback ──
+    try:
+        all_plugins: list[dict] = []
+        for status in ("active", "inactive"):
+            resp = _wp_rest(config, "GET", "plugins", params={"per_page": 100, "status": status})
+            if resp.status_code == 200:
+                all_plugins.extend(resp.json())
+            elif resp.status_code == 401:
+                return {
+                    "method": "rest_api", "total": 0, "active": [], "inactive": [],
+                    "updates": [], "all": [],
+                    "error": "REST API auth failed — check WP_USERNAME and WP_APP_PASSWORD",
+                }
+        return {
+            "method": "rest_api",
+            "total": len(all_plugins),
+            "active": [p for p in all_plugins if p.get("status") == "active"],
+            "inactive": [p for p in all_plugins if p.get("status") == "inactive"],
+            "updates": [],  # REST API does not expose update availability
+            "all": all_plugins,
+            "note": "Update status unavailable via REST API — configure SSH+WP-CLI for full info",
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "method": "none", "total": 0, "active": [], "inactive": [],
+            "updates": [], "all": [],
+            "error": str(e),
+        }
+
+
+def test_connections(config: WPConfig) -> dict:
+    """
+    Test each connection method (REST API, SSH+WP-CLI, WPScan API).
+    Returns a dict of results for each, used by the setup report.
+    """
+    results: dict[str, dict] = {}
+
+    # ── REST API ──
+    if config.url and config.username and config.app_password:
+        try:
+            with httpx.Client(timeout=10, follow_redirects=True) as client:
+                resp = client.get(
+                    f"{config.url}/wp-json/wp/v2/users/me",
+                    auth=(config.username, config.app_password),
+                )
+            if resp.status_code == 200:
+                name = resp.json().get("name", config.username)
+                results["rest_api"] = {"ok": True, "message": f"Connected as {name}"}
+            elif resp.status_code == 401:
+                results["rest_api"] = {"ok": False, "message": "Auth failed — check WP_USERNAME / WP_APP_PASSWORD"}
+            elif resp.status_code == 403:
+                results["rest_api"] = {"ok": False, "message": "Access denied — user needs Administrator role"}
+            else:
+                results["rest_api"] = {"ok": False, "message": f"HTTP {resp.status_code}"}
+        except httpx.ConnectError:
+            results["rest_api"] = {"ok": False, "message": f"Cannot reach {config.url} — check WP_URL"}
+        except Exception as e:
+            results["rest_api"] = {"ok": False, "message": str(e)}
+    else:
+        missing = [k for k, v in {"WP_URL": config.url, "WP_USERNAME": config.username, "WP_APP_PASSWORD": config.app_password}.items() if not v]
+        results["rest_api"] = {"ok": False, "message": f"Not configured — missing: {', '.join(missing)}", "missing_config": True}
+
+    # ── SSH + WP-CLI ──
+    if config.ssh_host and config.ssh_user:
+        ok, output = _run_wpcli(config, ["core", "version"])
+        if ok:
+            results["wpcli"] = {"ok": True, "message": f"WordPress {output.strip()}"}
+        else:
+            results["wpcli"] = {"ok": False, "message": output}
+    else:
+        results["wpcli"] = {
+            "ok": False,
+            "message": "Not configured — add WP_SSH_HOST + WP_SSH_USER to .env",
+            "missing_config": True,
+        }
+
+    # ── WPScan API ──
+    if config.wpscan_token:
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(
+                    "https://wpscan.com/api/v3/status",
+                    headers={"Authorization": f"Token token={config.wpscan_token}"},
+                )
+            if resp.status_code == 200:
+                data = resp.json()
+                requests_remaining = data.get("requests_remaining_30_days", "?")
+                results["wpscan"] = {"ok": True, "message": f"Valid — {requests_remaining} requests remaining"}
+            else:
+                results["wpscan"] = {"ok": False, "message": f"Token rejected (HTTP {resp.status_code})"}
+        except Exception as e:
+            results["wpscan"] = {"ok": False, "message": str(e)}
+    else:
+        results["wpscan"] = {
+            "ok": False,
+            "message": "Not configured — add WPSCAN_API_TOKEN to .env",
+            "missing_config": True,
+        }
+
+    return results
+
+
+def run_setup_check() -> str:
+    """
+    First-run setup check. Tests all connections, audits every installed plugin,
+    checks security config, verifies backups, and returns a Telegram-ready
+    report with clear action items and any missing configuration.
+    """
+    config = load_wp_config()
+
+    if not config.url:
+        return (
+            "*WordPress Setup Check*\n\n"
+            "\u274c WP\\_URL is not set in .env\n\n"
+            "Minimum required in .env to get started:\n"
+            "`WP_URL=https://yoursite.com`\n"
+            "`WP_USERNAME=your\\_admin`\n"
+            "`WP_APP_PASSWORD=xxxx xxxx xxxx xxxx`"
+        )
+
+    lines: list[str] = ["*WordPress Setup Check*\n"]
+    action_items: list[str] = []
+
+    # ── Connections ──────────────────────────────────────────────────────────
+    lines.append("*1. Connections*")
+    conns = test_connections(config)
+
+    for key, label in [("rest_api", "REST API"), ("wpcli", "SSH + WP-CLI"), ("wpscan", "WPScan API")]:
+        c = conns[key]
+        if c["ok"]:
+            icon = "\u2705"
+        elif c.get("missing_config"):
+            icon = "\u26a0\ufe0f"
+        else:
+            icon = "\u274c"
+        lines.append(f"{icon} {label} \u2014 {c['message']}")
+
+    lines.append("")
+
+    # ── Plugin audit ─────────────────────────────────────────────────────────
+    if conns["rest_api"]["ok"] or conns["wpcli"]["ok"]:
+        lines.append("*2. Plugin Audit*")
+        pd = get_all_plugins(config)
+
+        if pd["error"]:
+            lines.append(f"\u274c {pd['error']}")
+        else:
+            lines.append(f"Found {pd['total']} plugins ({len(pd['active'])} active, {len(pd['inactive'])} inactive)")
+
+            # Note if update info is unavailable
+            if pd.get("note"):
+                lines.append(f"_\u26a0\ufe0f {pd['note']}_")
+
+            # Updates
+            if pd["updates"]:
+                lines.append(f"\n*Updates available ({len(pd['updates'])}):*")
+                for p in pd["updates"]:
+                    ver = p.get("version", "")
+                    new_ver = p.get("update_version", "")
+                    arrow = f" \u2192 {new_ver}" if new_ver else ""
+                    lines.append(f"  \u2022 {_plugin_name(p)} {ver}{arrow}")
+                action_items.append(f"Apply {len(pd['updates'])} plugin update(s) \u2014 run /wp\\_update")
+            elif pd["method"] == "wpcli":
+                lines.append("\u2705 All plugins up to date")
+
+            # Inactive plugins
+            inactive_slugs = [_plugin_slug(p) for p in pd["inactive"]]
+            removable = [s for s in inactive_slugs if s in _REMOVE_SLUGS]
+            other_inactive = [s for s in inactive_slugs if s not in _REMOVE_SLUGS]
+
+            if removable:
+                lines.append(f"\n*Delete these (default/useless plugins):*")
+                for s in removable:
+                    lines.append(f"  \u2022 {s}")
+                action_items.append(f"Delete {len(removable)} useless plugin(s): {', '.join(removable)}")
+
+            if other_inactive:
+                lines.append(f"\n*Inactive plugins \u2014 delete if not needed ({len(other_inactive)}):*")
+                for s in other_inactive[:6]:
+                    lines.append(f"  \u2022 {s}")
+                if len(other_inactive) > 6:
+                    lines.append(f"  \u2026 and {len(other_inactive) - 6} more")
+                action_items.append(f"Review and delete {len(other_inactive)} inactive plugin(s) \u2014 inactive plugins still carry security risk")
+
+            # Essential plugin categories
+            all_slugs = {_plugin_slug(p) for p in pd["all"]}
+            has_backup = bool(all_slugs & _BACKUP_SLUGS)
+            has_security = bool(all_slugs & _SECURITY_SLUGS)
+
+            lines.append("\n*Essential plugins:*")
+            lines.append(f"{'✅' if has_backup else '❌'} Backup plugin \u2014 {'installed' if has_backup else 'MISSING \u2014 install UpdraftPlus (free)'}")
+            lines.append(f"{'✅' if has_security else '❌'} Security plugin \u2014 {'installed' if has_security else 'MISSING \u2014 install Wordfence (free)'}")
+
+            if not has_backup:
+                action_items.append("Install UpdraftPlus (free backup plugin) \u2014 required before any plugin updates")
+            if not has_security:
+                action_items.append("Install Wordfence (free security plugin) \u2014 monitors for malware and attacks")
+
+        lines.append("")
+
+    # ── Security config ───────────────────────────────────────────────────────
+    if conns["wpcli"]["ok"]:
+        lines.append("*3. Security Config*")
+        sec = check_security(config)
+        if sec["findings"]:
+            for f in sec["findings"]:
+                lines.append(f"\u26a0\ufe0f {f}")
+            action_items.extend(sec["findings"])
+        else:
+            lines.append("\u2705 No issues found")
+        lines.append("")
+
+    # ── Backup status ─────────────────────────────────────────────────────────
+    if conns["wpcli"]["ok"] or conns["rest_api"]["ok"]:
+        lines.append("*4. Backup Status*")
+        backup = check_last_backup(config)
+        icon = "\u2705" if backup["ok"] else "\u274c"
+        lines.append(f"{icon} {backup['message']}")
+        if backup.get("plugin") and backup["plugin"] != "unknown":
+            lines.append(f"  Plugin: {backup['plugin']}")
+        if not backup["ok"]:
+            action_items.insert(0, "Run a manual backup before applying any updates")
+        lines.append("")
+
+    # ── Missing .env config ───────────────────────────────────────────────────
+    missing_env: list[str] = []
+    if not config.ssh_host:
+        missing_env.append("`WP_SSH_HOST` \u2014 your server's hostname or IP")
+    if not config.ssh_user:
+        missing_env.append("`WP_SSH_USER` \u2014 your SSH login username")
+    if not config.wpscan_token:
+        missing_env.append("`WPSCAN_API_TOKEN` \u2014 optional, from wpscan.com/api (free)")
+
+    if missing_env:
+        lines.append("*Still needed in .env:*")
+        for m in missing_env:
+            lines.append(f"\u2022 {m}")
+        lines.append("")
+
+    # ── Action items ──────────────────────────────────────────────────────────
+    if action_items:
+        lines.append("*Action Items:*")
+        for i, item in enumerate(action_items, 1):
+            lines.append(f"{i}. {item}")
+    else:
+        lines.append("\u2705 Everything is configured and looks good.")
+
+    return "\n".join(lines)
+
+
 # ── Orchestration ──────────────────────────────────────────────────────────────
 
 def run_quick_health_check() -> str:
